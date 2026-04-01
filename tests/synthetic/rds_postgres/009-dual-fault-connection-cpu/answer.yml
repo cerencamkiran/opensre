@@ -6,6 +6,10 @@ required_keywords:
   - query
 required_evidence_sources:
   - performance_insights
+ruling_out_keywords:
+  - connection
+  - cpu
+  - leak
 optimal_trajectory:
   - query_grafana_metrics
   - query_grafana_logs

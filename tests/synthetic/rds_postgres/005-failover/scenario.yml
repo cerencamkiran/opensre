@@ -8,7 +8,10 @@ db_instance_identifier: payments-prod
 db_cluster: payments-cluster
 failure_mode: failover
 severity: critical
-scenario_difficulty: 1
+scenario_difficulty: 3
+adversarial_signals:
+  - ReplicaLag blips ~28s during failover window — could mislead toward replication_lag diagnosis
+  - DatabaseConnections drop to 0 then spike — looks like connection exhaustion
 available_evidence:
   - rds_metrics
   - rds_events

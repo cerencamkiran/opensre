@@ -7,7 +7,10 @@ region: us-east-1
 db_instance_identifier: orders-prod
 failure_mode: storage_full
 severity: critical
-scenario_difficulty: 1
+scenario_difficulty: 3
+adversarial_signals:
+  - CPUUtilization mildly elevated from I/O stall during bulk archival — could mislead toward cpu_saturation
+  - SwapUsage elevated — looks like memory pressure
 available_evidence:
   - rds_metrics
   - rds_events

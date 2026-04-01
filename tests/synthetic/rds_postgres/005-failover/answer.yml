@@ -4,6 +4,9 @@ required_keywords:
   - Multi-AZ
 required_evidence_sources:
   - rds_events
+ruling_out_keywords:
+  - replica
+  - storage
 optimal_trajectory:
   - query_grafana_logs
   - query_grafana_metrics
@@ -18,6 +21,8 @@ model_response: |
   - CPUUtilization and WriteIOPS both dropped to near-zero during the same window, confirming the instance was unavailable (not a connection pool issue). [evidence: rds_metrics]
   - RDS events show: failover initiated (08:04:18Z) → in progress (08:04:21Z) → completed (08:04:58Z) → available (08:05:04Z). [evidence: rds_events]
   - Performance Insights shows no anomalous queries before or after the failover window. Workload resumed normally afterward. [evidence: performance_insights]
+  - ReplicaLag showed a transient blip of ~28 seconds at 08:03–08:06Z — this is a normal symptom of the Multi-AZ promotion handoff, not an independent replication lag root cause. [evidence: rds_metrics]
+  - FreeStorageSpace remained unchanged throughout the window, ruling out any storage exhaustion contribution. [evidence: rds_metrics]
 
   NON_VALIDATED_CLAIMS:
   - Application connection retry logic should be reviewed to minimize reconnection time after future failovers.

@@ -7,7 +7,7 @@ region: us-west-2
 db_instance_identifier: users-prod
 failure_mode: healthy
 severity: warning
-scenario_difficulty: 2
+scenario_difficulty: 3
 adversarial_signals:
   - CPUUtilization
   - DatabaseConnections

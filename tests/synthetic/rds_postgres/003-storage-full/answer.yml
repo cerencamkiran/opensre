@@ -4,6 +4,9 @@ required_keywords:
   - FreeStorageSpace
 required_evidence_sources:
   - rds_events
+ruling_out_keywords:
+  - cpu
+  - replication
 optimal_trajectory:
   - query_grafana_metrics
   - query_grafana_logs
@@ -27,3 +30,5 @@ model_response: |
   - WriteIOPS sustained 6000-8100 IOPS depleting the 100 GB volume in 15 minutes.
   - FreeStorageSpace reached 0, causing the RDS engine to reject all further writes.
   - The instance entered an incompatible-restore state and stopped accepting connections.
+  - CPUUtilization shows moderate elevation from the I/O-intensive archival workload — this is a consequence of storage exhaustion triggering I/O waits, not an independent CPU saturation root cause.
+  - ReplicaLag is not a factor; no replica lag signal is present.

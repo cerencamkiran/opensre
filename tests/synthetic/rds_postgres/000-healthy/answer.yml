@@ -2,6 +2,8 @@ root_cause_category: healthy
 required_keywords:
   - normal bounds
   - no failure
+ruling_out_keywords:
+  - normal
 optimal_trajectory:
   - query_grafana_metrics
   - query_grafana_logs

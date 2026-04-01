@@ -9,7 +9,8 @@ failure_mode: storage_full
 severity: critical
 scenario_difficulty: 3
 adversarial_signals:
-  - FreeStorageSpace_absent
+  - FreeStorageSpace metric absent — must infer from events and write latency collapse
+  - CPUUtilization elevated from I/O stall — could mislead toward cpu_saturation
 available_evidence:
   - rds_metrics
   - rds_events

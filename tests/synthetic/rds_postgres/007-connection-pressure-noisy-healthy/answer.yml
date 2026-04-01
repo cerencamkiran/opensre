@@ -5,6 +5,9 @@ required_keywords:
 forbidden_categories:
   - resource_exhaustion
   - infrastructure
+ruling_out_keywords:
+  - no active
+  - normal
 optimal_trajectory:
   - query_grafana_metrics
   - query_grafana_logs

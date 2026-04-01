@@ -8,6 +8,10 @@ db_instance_identifier: payments-prod
 db_cluster: payments-cluster
 failure_mode: replication_lag
 severity: critical
+scenario_difficulty: 3
+adversarial_signals:
+  - CPUUtilization elevated from WAL write load — looks like cpu_saturation
+  - DatabaseConnections slightly elevated from replica reader retries
 available_evidence:
   - rds_metrics
   - rds_events

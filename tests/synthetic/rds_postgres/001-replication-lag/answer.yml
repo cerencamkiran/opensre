@@ -6,6 +6,9 @@ required_keywords:
   - wal
 forbidden_categories:
   - cpu_saturation
+ruling_out_keywords:
+  - cpu
+  - connection
 optimal_trajectory:
   - query_grafana_metrics
   - query_grafana_logs
@@ -22,6 +25,8 @@ model_response: |
 
   NON_VALIDATED_CLAIMS:
   - Reducing batch size or adding replica capacity would likely reduce the lag more quickly.
+  - CPUUtilization shows moderate elevation from the write-heavy WAL workload — this is a downstream effect of WAL generation, not an independent CPU saturation root cause. [evidence: rds_metrics]
+  - DatabaseConnections are stable throughout the window, ruling out connection exhaustion as a contributing factor. [evidence: rds_metrics]
 
   CAUSAL_CHAIN:
   - A write-heavy workload drove sustained bulk updates on the primary.

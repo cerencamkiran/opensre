@@ -6,6 +6,9 @@ required_keywords:
   - client sessions
 forbidden_categories:
   - cpu_saturation
+ruling_out_keywords:
+  - cpu
+  - saturation
 optimal_trajectory:
   - query_grafana_metrics
   - query_grafana_logs

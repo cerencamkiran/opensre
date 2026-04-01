@@ -4,6 +4,9 @@ required_keywords:
   - storage space
 required_evidence_sources:
   - rds_events
+ruling_out_keywords:
+  - cpu
+  - replication
 optimal_trajectory:
   - query_grafana_logs
   - query_grafana_metrics
@@ -29,3 +32,5 @@ model_response: |
   - At 03:08:44Z, the disk became completely full — all write operations began blocking on Lock:relation.
   - WriteIOPS collapsed to zero as the storage engine could no longer commit any write.
   - WriteLatency climbed to 34+ seconds as transactions waited indefinitely for storage that was unavailable.
+  - CPUUtilization dropped sharply as writes ceased — this is not a CPU saturation event; the cpu signal confirms the write blockage, not compute pressure.
+  - ReplicaLag is not a contributing factor to this incident; the outage is caused entirely by storage exhaustion.

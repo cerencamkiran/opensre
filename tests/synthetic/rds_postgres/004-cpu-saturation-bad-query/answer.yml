@@ -7,6 +7,9 @@ required_evidence_sources:
   - performance_insights
 forbidden_categories:
   - connection_exhaustion
+ruling_out_keywords:
+  - storage
+  - checkpoint
 optimal_trajectory:
   - query_grafana_metrics
   - query_grafana_logs
@@ -25,6 +28,7 @@ model_response: |
 
   NON_VALIDATED_CLAIMS:
   - Adding a partial index on (status) for non-completed orders would likely reduce CPU load by 80%+.
+  - FreeStorageSpace remained stable throughout the window — this is not a storage exhaustion or checkpoint-storm event. The CPU saturation is caused by application query CPU:user load (5.9 AAS), not I/O-driven LWLock contention. [evidence: rds_metrics, performance_insights]
 
   CAUSAL_CHAIN:
   - The orders table has no index on the status column.

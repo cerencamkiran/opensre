@@ -6,6 +6,9 @@ required_keywords:
 required_evidence_sources:
   - rds_events
   - performance_insights
+ruling_out_keywords:
+  - cpu
+  - connection
 optimal_trajectory:
   - query_grafana_logs
   - query_grafana_metrics
@@ -30,3 +33,5 @@ model_response: |
   - The read replica (reporting-prod-replica-1) cannot replay WAL at this rate, accumulating lag.
   - The ReplicaLag CloudWatch metric is not being published for this replica (provisioned too recently for the metric to appear in CloudWatch).
   - RDS control-plane events and PI WAL:Lock dominance confirm the lag is caused by WAL replay falling behind, not by a replica failure.
+  - CPUUtilization shows mild elevation from the write-heavy ETL workload — this is a downstream effect of WAL generation, not an independent CPU saturation root cause.
+  - DatabaseConnections are stable throughout the window, ruling out connection exhaustion as a factor.

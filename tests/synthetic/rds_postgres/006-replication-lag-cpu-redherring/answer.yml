@@ -7,6 +7,9 @@ forbidden_categories:
   - cpu_saturation
 required_evidence_sources:
   - performance_insights
+ruling_out_keywords:
+  - cpu
+  - confounder
 optimal_trajectory:
   - query_grafana_metrics
   - query_grafana_logs

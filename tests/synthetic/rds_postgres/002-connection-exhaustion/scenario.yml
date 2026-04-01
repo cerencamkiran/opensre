@@ -8,6 +8,10 @@ db_instance_identifier: payments-prod
 db_cluster: payments-cluster
 failure_mode: connection_exhaustion
 severity: critical
+scenario_difficulty: 3
+adversarial_signals:
+  - CPUUtilization elevated 35-50% from idle session query load — looks like cpu_saturation
+  - FreeStorageSpace stable but BinLogDiskUsage growing — decoy storage signal
 available_evidence:
   - rds_metrics
   - rds_events

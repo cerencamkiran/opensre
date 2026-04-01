@@ -10,7 +10,8 @@ failure_mode: replication_lag
 severity: critical
 scenario_difficulty: 3
 adversarial_signals:
-  - ReplicaLag_absent
+  - ReplicaLag metric absent — must infer from TransactionLogsGeneration and RDS events
+  - CPUUtilization mildly elevated from WAL write load — could mislead toward cpu_saturation
 available_evidence:
   - rds_metrics
   - rds_events
