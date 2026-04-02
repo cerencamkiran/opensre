@@ -59,14 +59,17 @@ def run_investigation_cli(
         severity=severity,
     )
     state = _call_run_investigation(
-        resolved_alert_name,
-        resolved_pipeline_name,
-        resolved_severity,
-        raw_alert=raw_alert,
+    resolved_alert_name,
+    resolved_pipeline_name,
+    resolved_severity,
+    raw_alert=raw_alert,
     )
+
+    slack_message = state["slack_message"]
+
     return {
-        "slack_message": state["slack_message"],
-        "report": state["slack_message"],
+        "slack_message": slack_message,
+        "report": slack_message,
         "problem_md": state["problem_md"],
         "root_cause": state["root_cause"],
     }
