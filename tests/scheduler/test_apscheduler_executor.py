@@ -384,3 +384,86 @@ def test_shutdown_does_not_join_control_lookup_blocked_on_scheduler(
     assert not shutdown_thread.is_alive()
     assert not shutdown_errors
     assert control_exited.wait(5)
+
+
+def test_sqlite_thousand_task_burst_uses_bounded_futures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Exercise real persisted rows and production recovery queries under load."""
+    from infrastructure.scheduling.scheduler import runner
+    from infrastructure.scheduling.scheduler.storage import (
+        complete_run,
+        database,
+        get_backlog_snapshot,
+        try_claim,
+        try_queue_run,
+    )
+    from infrastructure.scheduling.scheduler.types import TaskStatus
+
+    capacity = 2
+    task_count = 1_000
+    db_path = tmp_path / "real-dispatch.db"
+    monkeypatch.setattr(database, "default_run_database_path", lambda: db_path)
+    scheduler = _DurableFakeScheduler()
+    runners = object()
+    jobs = [_fake_job(f"task-{i}", runners) for i in range(task_count)]
+    for job in jobs:
+        scheduler.add_job(job)
+    monkeypatch.setattr(
+        runner,
+        "list_tasks",
+        lambda: [SimpleNamespace(id=job.id, enabled=True) for job in jobs],
+    )
+    monkeypatch.setattr(scheduler_executor, "_record_backlog_state", lambda *_a, **_k: None)
+    started = threading.Event()
+    release = threading.Event()
+    done = threading.Event()
+    lock = threading.Lock()
+    completed = 0
+    active = 0
+
+    def run_real_sqlite(run: object, _runners: object) -> list[object]:
+        nonlocal completed, active
+        claim = try_claim(run.task_id, run.fire_time)
+        assert claim is not None
+        with lock:
+            active += 1
+            if active == capacity:
+                started.set()
+        try:
+            if run.task_id in {"task-0", "task-1"}:
+                assert release.wait(30)
+            complete_run(claim, status=TaskStatus.SUCCESS)
+        finally:
+            with lock:
+                active -= 1
+                completed += 1
+                if completed == task_count:
+                    done.set()
+        return []
+
+    monkeypatch.setattr(scheduler_executor, "_execute_recoverable_run", run_real_sqlite)
+    executor = scheduler_executor.ScheduledThreadPoolExecutor(
+        max_workers=capacity,
+        on_submit=lambda task_id, when: try_queue_run(
+            task_id, scheduler_executor._durable_fire_time(when)
+        ),
+    )
+    executor.start(scheduler, "default")
+    now = datetime.now(UTC)
+    try:
+        for i, job in enumerate(jobs):
+            executor.submit_job(job, [now + timedelta(seconds=i)])
+        assert started.wait(30)
+        assert executor.peak_in_memory_user_callbacks == capacity
+        assert get_backlog_snapshot().pending_count >= task_count - capacity
+        release.set()
+        assert done.wait(90)
+    finally:
+        release.set()
+        executor.shutdown(wait=True)
+
+    assert completed == task_count
+    assert executor.peak_in_memory_user_callbacks == capacity
+    assert get_backlog_snapshot().pending_count == 0

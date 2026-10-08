@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import traceback as traceback_module
 from collections.abc import Callable, Collection
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor as ControlThreadPoolExecutor
@@ -12,6 +13,7 @@ from datetime import UTC, datetime
 from functools import partial
 from typing import Any
 
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED, JobExecutionEvent
 from apscheduler.executors.base import MaxInstancesReachedError, run_job
 from apscheduler.executors.pool import ThreadPoolExecutor
 
@@ -213,6 +215,7 @@ class ScheduledThreadPoolExecutor(ThreadPoolExecutor):
         self._peak_in_memory_user_callbacks = 0
         self._active_task_ids: set[str] = set()
         self._deferred_task_ids: set[str] = set()
+        self._cancel_cleanup_requested = False
         self._one_shot_run_keys: set[tuple[str, str]] = set()
         self._runners: Any | None = None
         self._last_backlog_state: str | None = None
@@ -239,6 +242,9 @@ class ScheduledThreadPoolExecutor(ThreadPoolExecutor):
 
     def start(self, scheduler: Any, alias: str) -> None:
         super().start(scheduler, alias)
+        # APScheduler's BaseExecutor does not retain the job-store alias.
+        # The synthetic durable-dispatch JobExecutionEvent needs it.
+        self._alias = alias
         self._durable_dispatch = (
             self._on_submit is not None
             and callable(getattr(scheduler, "get_jobs", None))
@@ -254,6 +260,7 @@ class ScheduledThreadPoolExecutor(ThreadPoolExecutor):
         if job.id == _RECOVERY_JOB_ID:
             with self._dispatch_lock:
                 self._deferred_task_ids.clear()
+                self._cancel_cleanup_requested = True
             self._request_drain()
             return
 
@@ -345,6 +352,18 @@ class ScheduledThreadPoolExecutor(ThreadPoolExecutor):
                 self._control_requested = False
                 self._control_cycles += 1
             try:
+                with self._dispatch_lock:
+                    cleanup_cancelled = self._cancel_cleanup_requested
+                    self._cancel_cleanup_requested = False
+                if cleanup_cancelled:
+                    # Reconcile cancelled work before dispatch: current main
+                    # terminalizes pending rows for deleted/disabled tasks.
+                    from infrastructure.scheduling.scheduler.runner import (
+                        _skip_cancelled_recoverable_runs,
+                    )
+
+                    _skip_cancelled_recoverable_runs()
+                    self._retire_terminal_one_shot_keys()
                 self._fill_capacity()
             except Exception:  # noqa: BLE001 - control wake must survive storage failures
                 logger.warning("Scheduled durable dispatch cycle failed", exc_info=True)
@@ -552,6 +571,30 @@ class ScheduledThreadPoolExecutor(ThreadPoolExecutor):
             self._active_task_ids.discard(task_id)
             self._in_memory_user_callbacks = max(0, self._in_memory_user_callbacks - 1)
 
+    def _execution_event(
+        self,
+        run: Any,
+        code: int,
+        *,
+        exception: BaseException | None = None,
+        formatted_traceback: str | None = None,
+    ) -> JobExecutionEvent | None:
+        """Preserve APScheduler execution events after durable dispatch."""
+        try:
+            scheduled_run_time = datetime.fromisoformat(str(run.fire_time).replace("Z", "+00:00"))
+        except ValueError:
+            # Test adapters may supply opaque keys; production uses ISO UTC.
+            logger.debug("Invalid fire time for APScheduler event: %r", run.fire_time)
+            return None
+        return JobExecutionEvent(
+            code,
+            str(run.task_id),
+            self._alias,
+            scheduled_run_time,
+            exception=exception,
+            traceback=formatted_traceback,
+        )
+
     def _durable_future_done(self, run: Any, future: Future[list[Any]]) -> None:
         """Release a durable slot while deferring only the failed task itself."""
         exc, traceback = (
@@ -563,8 +606,20 @@ class ScheduledThreadPoolExecutor(ThreadPoolExecutor):
             with self._dispatch_lock:
                 self._deferred_task_ids.add(run.task_id)
             self._run_job_error(run.task_id, exc, traceback)
+            error_event = self._execution_event(
+                run,
+                EVENT_JOB_ERROR,
+                exception=exc,
+                formatted_traceback="".join(traceback_module.format_exception(exc)),
+            )
+            if error_event is not None:
+                self._scheduler._dispatch_event(error_event)
         else:
-            self._run_job_success(run.task_id, future.result())
+            events = future.result()
+            success_event = self._execution_event(run, EVENT_JOB_EXECUTED)
+            if success_event is not None:
+                events = [*events, success_event]
+            self._run_job_success(run.task_id, events)
 
         with self._dispatch_lock:
             self._active_task_ids.discard(run.task_id)
@@ -610,6 +665,20 @@ class ScheduledThreadPoolExecutor(ThreadPoolExecutor):
         if is_terminal:
             with self._dispatch_lock:
                 self._one_shot_run_keys.discard(run_key)
+
+    def _retire_terminal_one_shot_keys(self) -> None:
+        """Prune cancelled one-shot keys after the recovery cleanup."""
+        with self._dispatch_lock:
+            keys = tuple(self._one_shot_run_keys)
+        for task_id, fire_time in keys:
+            try:
+                terminal = _durable_run_is_terminal(task_id, fire_time)
+            except Exception:  # noqa: BLE001 - cleanup is best-effort
+                logger.debug("Could not inspect one-shot key %s at %s", task_id, fire_time)
+                continue
+            if terminal:
+                with self._dispatch_lock:
+                    self._one_shot_run_keys.discard((task_id, fire_time))
 
     def _runners_from_registered_job(self, task_id: str) -> Any | None:
         try:

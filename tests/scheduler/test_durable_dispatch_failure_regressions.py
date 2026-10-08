@@ -320,3 +320,122 @@ def test_failed_task_does_not_block_unrelated_pending_work(
         assert pending == [failed_run]
     finally:
         executor.shutdown(wait=True)
+
+
+def test_periodic_recovery_finishes_cancelled_sqlite_ticks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The control wake retains main's deleted-task cleanup behavior."""
+    import time
+
+    from infrastructure.scheduling.scheduler import runner
+    from infrastructure.scheduling.scheduler.storage import (
+        get_latest_run_for_fire_time,
+        try_queue_run,
+    )
+    from infrastructure.scheduling.scheduler.types import TaskStatus
+
+    db_path = tmp_path / "cancelled.db"
+    monkeypatch.setattr(database, "default_run_database_path", lambda: db_path)
+    monkeypatch.setattr(runner, "list_tasks", lambda: [])
+    monkeypatch.setattr(runner, "get_task", lambda _task_id: None)
+    monkeypatch.setattr(
+        runner, "record_scheduler_service_operation", lambda *_args, **_kwargs: None
+    )
+    _silence_observability(monkeypatch)
+    fire_time = "2026-09-17T12:00:00Z"
+    assert try_queue_run("deleted-task", fire_time)
+
+    scheduler = _Scheduler()
+    executor = scheduler_executor.ScheduledThreadPoolExecutor(
+        max_workers=1, on_submit=lambda _task_id, _scheduled: None
+    )
+    executor.start(scheduler, "default")
+    recovery = _job("scheduler-claim-recovery", object())
+    try:
+        executor.submit_job(recovery, [datetime.now(UTC)])
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            run = get_latest_run_for_fire_time("deleted-task", fire_time)
+            if run is not None and run.status is TaskStatus.SKIPPED:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("Deleted pending tick was not terminalized")
+    finally:
+        executor.shutdown(wait=True)
+
+
+def test_durable_dispatch_emits_apscheduler_execution_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Durable execution still notifies APScheduler execution listeners."""
+    import time
+
+    from apscheduler.events import EVENT_JOB_EXECUTED
+
+    fire_at = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
+    pending = [RecoverableRun("task-a", fire_at.isoformat())]
+    scheduler = _Scheduler([_job("task-a", object())])
+
+    def select_runs(eligible_task_ids: set[str], *, limit: int) -> list[RecoverableRun]:
+        return [r for r in pending if r.task_id in eligible_task_ids][:limit]
+
+    def run(_run: RecoverableRun, _runners: object) -> list[object]:
+        pending.clear()
+        return []
+
+    monkeypatch.setattr(scheduler_executor, "_enabled_task_ids", lambda: {"task-a"})
+    monkeypatch.setattr(scheduler_executor, "_recoverable_runs", select_runs)
+    monkeypatch.setattr(scheduler_executor, "_execute_recoverable_run", run)
+    _silence_observability(monkeypatch)
+    executor = scheduler_executor.ScheduledThreadPoolExecutor(
+        max_workers=1, on_submit=lambda _task_id, _scheduled: None
+    )
+    executor.start(scheduler, "default")
+    try:
+        executor.submit_job(scheduler.jobs["task-a"], [fire_at])
+        deadline = time.monotonic() + 5
+        while EVENT_JOB_EXECUTED not in scheduler.event_codes and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert EVENT_JOB_EXECUTED in scheduler.event_codes
+    finally:
+        executor.shutdown(wait=True)
+
+
+def test_durable_dispatch_emits_apscheduler_error_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Execution failures notify listeners, not only executor logging."""
+    import time
+
+    from apscheduler.events import EVENT_JOB_ERROR
+
+    fire_at = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
+    pending = [RecoverableRun("task-a", fire_at.isoformat())]
+    scheduler = _Scheduler([_job("task-a", object())])
+
+    def select_runs(eligible_task_ids: set[str], *, limit: int) -> list[RecoverableRun]:
+        return [r for r in pending if r.task_id in eligible_task_ids][:limit]
+
+    def fail(_run: RecoverableRun, _runners: object) -> list[object]:
+        pending.clear()
+        raise RuntimeError("simulated durable dispatch failure")
+
+    monkeypatch.setattr(scheduler_executor, "_enabled_task_ids", lambda: {"task-a"})
+    monkeypatch.setattr(scheduler_executor, "_recoverable_runs", select_runs)
+    monkeypatch.setattr(scheduler_executor, "_execute_recoverable_run", fail)
+    _silence_observability(monkeypatch)
+    executor = scheduler_executor.ScheduledThreadPoolExecutor(
+        max_workers=1, on_submit=lambda _task_id, _scheduled: None
+    )
+    executor.start(scheduler, "default")
+    try:
+        executor.submit_job(scheduler.jobs["task-a"], [fire_at])
+        deadline = time.monotonic() + 5
+        while EVENT_JOB_ERROR not in scheduler.event_codes and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert EVENT_JOB_ERROR in scheduler.event_codes
+    finally:
+        executor.shutdown(wait=True)

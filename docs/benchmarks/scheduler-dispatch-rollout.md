@@ -44,8 +44,9 @@ The following invariants are part of the scheduler contract:
   so a filtered resync cannot keep claiming work for a task that moved to another
   scheduler owner. APScheduler date jobs retain only their admitted one-shot tick
   after the job itself is removed.
-- Disabled tasks remain durable and can resume when re-enabled. Deleted schedules
-  are not reported as operator backlog by `opensre cron status`.
+- The periodic recovery wake preserves current cancellation semantics: queued
+  work for deleted/disabled tasks becomes terminal `SKIPPED` instead of firing
+  on later re-enablement. Deleted schedules are excluded from `cron status`.
 
 Structured operations-log events named `scheduler_backlog_state_changed` record
 only state and capacity metadata (`state`, pending count/age, active runs, and
@@ -92,19 +93,21 @@ uv run pytest \
   tests/scheduler/test_apscheduler_executor.py \
   tests/scheduler/test_durable_dispatch.py \
   tests/scheduler/test_durable_dispatch_review_regressions.py \
+  tests/scheduler/test_durable_dispatch_failure_regressions.py \
   tests/scheduler/test_runner.py -q
 ```
 
-After #6173 is integrated into the same revision, also run its deterministic
-capacity benchmark against the M4 implementation:
+The M1 benchmark is a **before** baseline that uses raw Python
+`ThreadPoolExecutor` rather than the production `ScheduledThreadPoolExecutor`.
+Re-running M1 unchanged does **not** measure bounded M4 dispatch. Preserve its
+original results. The real-SQLite 1,000-tick regression now exercises the
+production dispatcher, including capacity and durable admission.
 
-```bash
-uv run python -m tests.benchmarks.scheduler.capacity_benchmark
-```
-
-Do not publish an M5 **after** report from a revision that does not contain the
-M1/M2 benchmark harness and index migration. That would not be a like-for-like
-comparison.
+For the M5 **after** report, instrument the actual scheduler executor with
+controlled fake work and the same workloads, arrival rates, task duration,
+configuration and host as M1. Record peak callbacks, pending age, RSS, drain
+latency, query plans and lock failures. Do not publish an after estimate as an
+actual benchmark before running this comparison.
 
 ## M5 rollout gate
 

@@ -40,10 +40,13 @@ def get_recoverable_runs_for_scope(
 
     with database.connection() as conn:
         rows = conn.execute(
-            "SELECT current.task_id, current.fire_time FROM task_runs AS current "
-            "WHERE (current.status = ? OR (current.status = ? "
-            "AND current.lease_expires_at != '' AND current.lease_expires_at < ?)) "
-            "AND NOT EXISTS (SELECT 1 FROM task_runs AS live "
+            "WITH recovery_candidates AS ("
+            "SELECT task_id, fire_time, attempt, started_at FROM task_runs WHERE status = ? "
+            "UNION ALL "
+            "SELECT task_id, fire_time, attempt, started_at FROM task_runs "
+            "WHERE status = ? AND lease_expires_at != '' AND lease_expires_at < ?"
+            ") SELECT current.task_id, current.fire_time FROM recovery_candidates AS current "
+            "WHERE NOT EXISTS (SELECT 1 FROM task_runs AS live "
             "WHERE live.task_id = current.task_id AND live.status = ? "
             "AND live.lease_expires_at >= ?) "
             "AND ((? IS NOT NULL AND current.task_id IN (SELECT value FROM json_each(?))) "
