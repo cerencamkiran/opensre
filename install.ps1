@@ -1,13 +1,21 @@
+[CmdletBinding(DefaultParameterSetName = "untagged")]
 param(
     [ValidateSet("release", "main")]
     [string]$Channel = $(if ($env:OPENSRE_INSTALL_CHANNEL) { $env:OPENSRE_INSTALL_CHANNEL } else { "main" }),
-    [switch]$SkipMain
+    [switch]$SkipMain,
+    [Parameter(ParameterSetName = "landing_page")]
+    [switch]$lp,
+    [Parameter(ParameterSetName = "github")]
+    [switch]$gh,
+    [Parameter(ParameterSetName = "documentation")]
+    [switch]$dc
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $script:OpenSreProgressStep = 0
 $script:OpenSreChannelExplicit = $PSBoundParameters.ContainsKey("Channel") -or [bool]$env:OPENSRE_INSTALL_CHANNEL
+$script:OpenSreInstallOrigin = if ($lp) { "landing_page" } elseif ($gh) { "github" } elseif ($dc) { "documentation" } else { "" }
 
 function Test-OpenSreVerboseInstall {
     $value = [string]$env:OPENSRE_INSTALL_VERBOSE
@@ -435,7 +443,7 @@ function Invoke-OpenSreWithRetry {
         [scriptblock]$Operation,
         [Parameter(Mandatory = $true)]
         [string]$Description,
-        [int]$MaxAttempts = 3
+        [int]$MaxAttempts = 6
     )
 
     $attempt = 1
@@ -446,7 +454,9 @@ function Invoke-OpenSreWithRetry {
         }
         catch {
             $statusCode = Get-OpenSreHttpStatusCodeFromError -ErrorRecord $_
-            if ($null -ne $statusCode -and $statusCode -ge 400 -and $statusCode -lt 500) {
+            # 403 and 429 are GitHub rate limits from shared CI addresses.
+            # Other 4xx responses are final.
+            if ($null -ne $statusCode -and $statusCode -ge 400 -and $statusCode -lt 500 -and $statusCode -ne 403 -and $statusCode -ne 429) {
                 throw "Failed to $Description. $($_.Exception.Message)"
             }
 
@@ -454,8 +464,13 @@ function Invoke-OpenSreWithRetry {
                 throw "Failed to $Description after $attempt attempts. $($_.Exception.Message)"
             }
 
+            $wait = $attempt
+            if ($statusCode -eq 403 -or $statusCode -eq 429) {
+                $wait = [Math]::Min(30, [int][Math]::Pow(2, $attempt))
+            }
+
             Write-Warning "Attempt $attempt to $Description failed: $($_.Exception.Message). Retrying..."
-            Start-Sleep -Seconds $attempt
+            Start-Sleep -Seconds $wait
             $attempt += 1
         }
     }
@@ -1056,22 +1071,34 @@ function Send-OpenSreInstallAnalytics {
         [Parameter(Mandatory = $true)]
         [string]$Channel,
         [AllowEmptyString()]
-        [string]$Version
+        [string]$Version,
+        [ValidateSet("present", "absent", "unknown")]
+        [string]$InstallMarkerState = "unknown"
     )
 
     $previousSource = $env:OPENSRE_INSTALL_SOURCE
+    $previousOrigin = $env:OPENSRE_INSTALL_ORIGIN
     $previousChannel = $env:OPENSRE_INSTALL_CHANNEL
     $previousVersion = $env:OPENSRE_INSTALL_VERSION
+    $previousMarkerState = $env:OPENSRE_INSTALL_MARKER_STATE
     try {
         $env:OPENSRE_INSTALL_SOURCE = "powershell_installer"
+        $env:OPENSRE_INSTALL_ORIGIN = $script:OpenSreInstallOrigin
         $env:OPENSRE_INSTALL_CHANNEL = $Channel
         $env:OPENSRE_INSTALL_VERSION = $Version
+        $env:OPENSRE_INSTALL_MARKER_STATE = $InstallMarkerState
         & $BinaryPath --record-install *> $null
     }
     catch {
         # Analytics is best-effort and must never fail installation.
     }
     finally {
+        if ($null -eq $previousOrigin) {
+            Remove-Item Env:OPENSRE_INSTALL_ORIGIN -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:OPENSRE_INSTALL_ORIGIN = $previousOrigin
+        }
         if ($null -eq $previousSource) {
             Remove-Item Env:OPENSRE_INSTALL_SOURCE -ErrorAction SilentlyContinue
         }
@@ -1090,10 +1117,52 @@ function Send-OpenSreInstallAnalytics {
         else {
             $env:OPENSRE_INSTALL_VERSION = $previousVersion
         }
+        if ($null -eq $previousMarkerState) {
+            Remove-Item Env:OPENSRE_INSTALL_MARKER_STATE -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:OPENSRE_INSTALL_MARKER_STATE = $previousMarkerState
+        }
+    }
+}
+
+function Expand-OpenSreHomePrefix {
+    param([string]$Path)
+    if ($Path -eq "~") { return $HOME }
+    if ($Path.StartsWith("~/") -or $Path.StartsWith("~\")) {
+        return Join-Path $HOME $Path.Substring(2)
+    }
+    return $Path
+}
+
+function Get-OpenSreInstallMarkerDir {
+    # Mirror the runtime's get_store_path(): an explicit wizard store path wins
+    # and the marker lives beside it; otherwise OPENSRE_HOME, then ~/.opensre.
+    $storePath = ([string]$env:OPENSRE_WIZARD_STORE_PATH).Trim()
+    if ($storePath) {
+        return Split-Path -Parent (Expand-OpenSreHomePrefix $storePath)
+    }
+    $stateDir = ([string]$env:OPENSRE_HOME).Trim()
+    if (-not $stateDir) { $stateDir = Join-Path $HOME ".opensre" }
+    return Expand-OpenSreHomePrefix $stateDir
+}
+
+function Get-OpenSreInstallMarkerState {
+    try {
+        $stateDir = Get-OpenSreInstallMarkerDir
+        if (-not $stateDir) { $stateDir = "." }
+        if (Test-Path -LiteralPath (Join-Path $stateDir "installed") -ErrorAction Stop) {
+            return "present"
+        }
+        return "absent"
+    }
+    catch {
+        return "unknown"
     }
 }
 
 function Install-OpenSre {
+    $installMarkerState = Get-OpenSreInstallMarkerState
     $repo = if ($env:OPENSRE_INSTALL_REPO) { $env:OPENSRE_INSTALL_REPO } else { "Tracer-Cloud/opensre" }
     $installDir = if ($env:OPENSRE_INSTALL_DIR) { $env:OPENSRE_INSTALL_DIR } else { Get-OpenSreDefaultInstallDir }
     $binaryName = "opensre.exe"
@@ -1223,7 +1292,7 @@ function Install-OpenSre {
 
     $installedBinaryPath = Join-Path $installDir $binaryName
     $analyticsVersion = if ($binaryVersion) { $binaryVersion } elseif ($version) { $version } else { "main" }
-    Send-OpenSreInstallAnalytics -BinaryPath $installedBinaryPath -Channel $resolvedChannel -Version $analyticsVersion
+    Send-OpenSreInstallAnalytics -BinaryPath $installedBinaryPath -Channel $resolvedChannel -Version $analyticsVersion -InstallMarkerState $installMarkerState
     if ($resolvedChannel -eq "main") {
         if ($binaryVersion) {
             Write-Host "Installed opensre main build ($binaryVersion) to $installedBinaryPath"

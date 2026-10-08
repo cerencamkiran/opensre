@@ -14,6 +14,8 @@ from core.agent_harness.ports import (
     TurnAccounting,
 )
 from core.agent_harness.prompts.memory.conversation import expand_affirmative_follow_up
+from core.agent_harness.prompts.skills import active_skill_catalog
+from core.agent_harness.session.memory_consolidation import start_memory_consolidation
 from core.agent_harness.session.pending_offer import (
     clear_unconfirmed_pending_offers,
     consume_confirmed_pending_offer,
@@ -30,6 +32,8 @@ from core.agent_harness.turns.turn_results import (
     TurnResult,
 )
 from core.agent_harness.turns.turn_snapshot import TurnSnapshot
+from infrastructure.analytics.prompt_log.lifecycle import record_prompt_turn
+from infrastructure.analytics.prompt_log.recorder import PromptRecorder
 from infrastructure.observability.trace.observations import (
     TraceAttributes,
     is_observation_sink_active,
@@ -52,6 +56,9 @@ def stage_turn_error(session: Any, kind: str, message: str) -> None:
     setter = getattr(terminal, "set_pending_turn_error", None)
     if callable(setter):
         setter(kind, message)
+    recorder = PromptRecorder.current()
+    if recorder is not None:
+        recorder.set_error(kind, message)
 
 
 def stage_turn_llm_failure(session: Any, *, client: Any | None = None) -> None:
@@ -64,12 +71,15 @@ def stage_turn_llm_failure(session: Any, *, client: Any | None = None) -> None:
 
     terminal = getattr(session, "terminal", None)
     setter = getattr(terminal, "set_pending_turn_llm", None)
-    if not callable(setter):
-        return
     model = resolve_model_name(client) if client is not None else None
     provider = resolve_provider_name(client) if client is not None else None
     if model or provider:
-        setter(LlmRunInfo(model=model, provider=provider))
+        run = LlmRunInfo(model=model, provider=provider)
+        if callable(setter):
+            setter(run)
+        recorder = PromptRecorder.current()
+        if recorder is not None:
+            recorder.set_run(run)
 
 
 def _cancelled_turn_result(
@@ -115,9 +125,13 @@ def run_turn(
     input, the assistant reply the output, ``session_id`` groups the turns of a
     conversation and ``user_id`` names who took the turn. The outermost turn
     owns the session id; a turn nested inside it (a loop run from a command, a
-    tool driving a headless turn) inherits it rather than stamping its own.
+    tool driving a headless turn) inherits it rather than stamping its own. It
+    also binds the turn's skill catalog, which nested turns reuse.
     """
     with (
+        # One skill catalog per turn: a release pulled mid-turn applies to the next.
+        active_skill_catalog().bind_turn(),
+        record_prompt_turn(text, session, surface=surface) as recorder,
         inherit_trace_session(getattr(session, "session_id", None)) as trace_session,
         observe_span(
             _TURN_OBSERVATION_NAME,
@@ -139,6 +153,11 @@ def run_turn(
             output=result.primary_response_text or None,
             metadata=_turn_outcome_metadata(result),
         )
+        if recorder is not None:
+            if result.cancelled:
+                recorder.set_error("cancelled", "Agent execution cancelled.")
+            else:
+                recorder.set_response(result.primary_response_text)
         return result
 
 
@@ -174,8 +193,15 @@ def _run_turn(
     surface: str,
     output: OutputSink | None,
 ) -> TurnResult:
+    from core.llm.hosted_credits import prefetch_hosted_credits
+
+    prefetch_hosted_credits()
+    # Here, not at session start: a gateway transport binds its surface (and so
+    # the member's memory opt-in) only around the turn.
+    start_memory_consolidation()
     auto_compact_if_needed(session)
     prior_messages = getattr(session, "cli_agent_messages", None) or ()
+    typed_text = text
     expanded = expand_affirmative_follow_up(
         text,
         prior_messages,
@@ -190,7 +216,6 @@ def _run_turn(
         TurnSnapshot.from_session(text, session, surface=surface),
         session,
     )
-    session.last_command_observation = None
     action_result = execute_actions(
         text,
         confirm_fn=confirm_fn,
@@ -209,7 +234,13 @@ def _run_turn(
     if action_result.hit_iteration_cap and not action_result.response_streamed:
         response_text = "\n\n".join(filter(None, (response_text, _ITERATION_CAP_MESSAGE)))
     if response_text:
-        record_conversation_turn(session, text, response_text)
+        record_conversation_turn(
+            session,
+            text,
+            response_text,
+            tool_items=action_result.history_items,
+            typed_text=typed_text,
+        )
     return accounting.finalize(
         TurnResult(
             final_intent=(

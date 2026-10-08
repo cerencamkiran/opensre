@@ -36,9 +36,9 @@ INSTALL_PS1 = REPO_ROOT / "install.ps1"
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 MAKEFILE = REPO_ROOT / "Makefile"
 README = REPO_ROOT / "README.md"
-QUICKSTART = REPO_ROOT / "docs" / "quickstart.mdx"
-INSTALL_MDX = REPO_ROOT / "docs" / "install.mdx"
-INSTALL_LOCAL = REPO_ROOT / "docs" / "install-local.mdx"
+QUICKSTART = REPO_ROOT / "docs" / "getting-started" / "quickstart.mdx"
+INSTALL_MDX = REPO_ROOT / "docs" / "install" / "index.mdx"
+INSTALL_LOCAL = REPO_ROOT / "docs" / "install" / "install-local.mdx"
 SETUP = REPO_ROOT / "SETUP.md"
 HOMEBREW_SYNC = REPO_ROOT / ".github" / "scripts" / "sync-homebrew-tap-formula.sh"
 
@@ -66,9 +66,23 @@ def _write_fake_opensre(binary: Path, *, version_line: str) -> None:
         textwrap.dedent(
             f"""\
             #!/usr/bin/env bash
+            state_dir="${{OPENSRE_HOME:-$HOME/.opensre}}"
+            if [ -n "${{OPENSRE_WIZARD_STORE_PATH:-}}" ]; then
+              state_dir="$(dirname "$OPENSRE_WIZARD_STORE_PATH")"
+            fi
             if [ "${{1:-}}" = "--version" ]; then
+              case "${{OPENSRE_TEST_MARKER_MUTATION:-}}" in
+                create) mkdir -p "$state_dir"; touch "$state_dir/installed" ;;
+                remove) rm -f "$state_dir/installed" ;;
+              esac
               printf '%s\\n' {json.dumps(version_line)}
               exit 0
+            fi
+            if [ "${{1:-}}" = "--record-install" ] && [ -n "${{OPENSRE_TEST_MARKER_LOG:-}}" ]; then
+              printf '%s\\n' "${{OPENSRE_INSTALL_MARKER_STATE:-unset}}" > "$OPENSRE_TEST_MARKER_LOG"
+            fi
+            if [ "${{1:-}}" = "--record-install" ] && [ -n "${{OPENSRE_TEST_ORIGIN_LOG:-}}" ]; then
+              printf '%s\\n' "${{OPENSRE_INSTALL_ORIGIN:-}}" "${{OPENSRE_INSTALL_CHANNEL:-}}" "${{OPENSRE_INSTALL_SOURCE:-}}" > "$OPENSRE_TEST_ORIGIN_LOG"
             fi
             printf 'opensre-stub\\n'
             exit 0
@@ -104,11 +118,26 @@ def _build_release_assets(
     return archive_name
 
 
-def _write_curl_shim(bin_dir: Path, assets_dir: Path, release_json_by_url: dict[str, str]) -> None:
+def _write_curl_shim(
+    bin_dir: Path,
+    assets_dir: Path,
+    release_json_by_url: dict[str, str],
+    *,
+    mode: str = "",
+) -> None:
     """Shim ``curl`` so install.sh never hits the network."""
     bin_dir.mkdir(parents=True, exist_ok=True)
     mapping_path = bin_dir / "url_map.json"
     mapping_path.write_text(json.dumps(release_json_by_url), encoding="utf-8")
+    state_path = bin_dir / "failures"
+    calls_path = bin_dir / "calls.log"
+    if mode == "rate-limit":
+        state_path.write_text("1\n", encoding="utf-8")
+    elif mode == "missing":
+        state_path.write_text("missing\n", encoding="utf-8")
+    else:
+        state_path.write_text("0\n", encoding="utf-8")
+    calls_path.write_text("", encoding="utf-8")
     shim = bin_dir / "curl"
     shim.write_text(
         textwrap.dedent(
@@ -117,6 +146,8 @@ def _write_curl_shim(bin_dir: Path, assets_dir: Path, release_json_by_url: dict[
             set -euo pipefail
             out=""
             url=""
+            http1=false
+            write_out=false
             args=("$@")
             i=0
             while [ "$i" -lt "${{#args[@]}}" ]; do
@@ -126,7 +157,14 @@ def _write_curl_shim(bin_dir: Path, assets_dir: Path, release_json_by_url: dict[
                   i=$((i + 1))
                   out="${{args[$i]}}"
                   ;;
-                -H|--header|--retry|--retry-delay) i=$((i + 1)) ;;
+                -w|--write-out)
+                  i=$((i + 1))
+                  write_out=true
+                  ;;
+                -H|--header|--retry|--retry-delay|--connect-timeout|--max-time|-D|--dump-header)
+                  i=$((i + 1))
+                  ;;
+                --http1.1) http1=true ;;
                 --fail|--silent|--show-error|--location) ;;
                 http://*|https://*) url="$arg" ;;
               esac
@@ -135,16 +173,53 @@ def _write_curl_shim(bin_dir: Path, assets_dir: Path, release_json_by_url: dict[
             [ -n "$url" ] || {{ echo "curl-shim: missing url: $*" >&2; exit 2; }}
             map={json.dumps(str(mapping_path))}
             assets={json.dumps(str(assets_dir))}
+            state={json.dumps(str(state_path))}
+            calls={json.dumps(str(calls_path))}
+            emit() {{
+              local code="$1"
+              local body="$2"
+              if [ -n "$out" ]; then printf '%s' "$body" >"$out"; fi
+              if [ "$write_out" = true ]; then
+                printf '%s' "$code"
+              elif [ -z "$out" ]; then
+                printf '%s' "$body"
+              fi
+            }}
             if printf '%s' "$url" | grep -q 'api.github.com'; then
-              body="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$map" "$url")"
-              if [ -n "$out" ]; then printf '%s' "$body" >"$out"; else printf '%s' "$body"; fi
+              if [ "$http1" != false ]; then
+                echo "metadata requests must not force HTTP/1.1" >&2
+                exit 1
+              fi
+              mode="$(tr -d '[:space:]' < "$state")"
+              code=200
+              if [ "$mode" = "missing" ]; then
+                code=404
+              elif [ "$mode" -gt 0 ] 2>/dev/null; then
+                printf '%s\\n' "$((mode - 1))" > "$state"
+                code=403
+              fi
+              if [ "$code" = 200 ]; then
+                body="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$map" "$url")"
+              elif [ "$code" = 403 ]; then
+                body='{{"message":"API rate limit exceeded"}}'
+              else
+                body='{{"message":"Not Found"}}'
+              fi
+              printf 'api %s\\n' "$code" >> "$calls"
+              emit "$code" "$body"
               exit 0
             fi
             if printf '%s' "$url" | grep -q 'releases/download/'; then
+              if [ "$http1" != true ]; then
+                echo "curl: (92) HTTP/2 stream was not closed cleanly" >&2
+                exit 92
+              fi
               name="$(basename "$url")"
               src="$assets/$name"
               [ -f "$src" ] || {{ echo "curl-shim: missing asset $src for $url" >&2; exit 1; }}
-              if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
+              if [ -n "$out" ]; then cp "$src" "$out"; elif [ "$write_out" != true ]; then cat "$src"; fi
+              if [ "$write_out" = true ]; then printf '%s' "200"; fi
+              printf 'asset 200\\n' >> "$calls"
               exit 0
             fi
             echo "curl-shim: unhandled url $url" >&2
@@ -160,10 +235,12 @@ def _run_install_sh(
     tmp_path: Path,
     *args: str,
     env_extra: dict[str, str] | None = None,
+    piped: bool = False,
+    curl_mode: str = "",
 ) -> subprocess.CompletedProcess[str]:
     plat, arch = _host_platform_arch()
     home = tmp_path / "home"
-    home.mkdir()
+    home.mkdir(exist_ok=True)
     install_dir = tmp_path / "opt" / "bin"
     install_dir.mkdir(parents=True)
     assets = tmp_path / "assets"
@@ -208,9 +285,12 @@ def _run_install_sh(
         f"https://api.github.com/repos/Tracer-Cloud/opensre/releases/tags/v{version}": version_json,
         "https://api.github.com/repos/Tracer-Cloud/opensre/releases/latest": latest_json,
     }
-    _write_curl_shim(shim_bin, assets, url_map)
+    _write_curl_shim(shim_bin, assets, url_map, mode=curl_mode)
 
     env = os.environ.copy()
+    env.pop("OPENSRE_HOME", None)
+    env.pop("OPENSRE_WIZARD_STORE_PATH", None)
+    env.pop("OPENSRE_INSTALL_MARKER_STATE", None)
     env["HOME"] = str(home)
     env["PATH"] = f"{shim_bin}{os.pathsep}{env.get('PATH', '')}"
     env["OPENSRE_AUTO_LAUNCH"] = "0"
@@ -220,9 +300,16 @@ def _run_install_sh(
     if env_extra:
         env.update(env_extra)
 
-    cmd = ["bash", str(INSTALL_SH), "--install-dir", str(install_dir), *args]
+    cmd = [
+        "bash",
+        *(["-s", "--"] if piped else [str(INSTALL_SH)]),
+        "--install-dir",
+        str(install_dir),
+        *args,
+    ]
     return subprocess.run(
         cmd,
+        input=INSTALL_SH.read_text() if piped else None,
         cwd=str(tmp_path),
         env=env,
         capture_output=True,
@@ -241,36 +328,41 @@ def _run_install_sh(
         (
             README,
             (
-                "curl -fsSL https://install.opensre.com | bash",
-                "irm https://install.opensre.com | iex",
+                "curl -fsSL https://install.opensre.com | bash -s -- -gh",
+                "## Before you begin",
+                "## Step 1: Install and start opensre",
+                "opensre\n",
+                "images/opensre-welcome.png",
             ),
         ),
         (
             QUICKSTART,
             (
-                "brew tap tracer-cloud/tap",
-                "brew install tracer-cloud/tap/opensre",
-                "curl -fsSL https://install.opensre.com | bash",
-                "irm https://install.opensre.com | iex",
+                "curl -fsSL https://install.opensre.com | bash -s -- -dc",
+                "## Before you begin",
+                "## Step 1: Install and start opensre",
+                "opensre\n",
+                "images/opensre-welcome.png",
             ),
         ),
         (
             INSTALL_MDX,
             (
-                "curl -fsSL https://install.opensre.com | bash",
-                "irm https://install.opensre.com | iex",
-                "opensre onboard",
+                "curl -fsSL https://install.opensre.com | bash -s -- -dc",
+                "## Before you begin",
+                "## Step 1: Install and start opensre",
+                "opensre\n",
+                "images/opensre-welcome.png",
             ),
         ),
         (
             INSTALL_LOCAL,
             (
-                "brew tap tracer-cloud/tap",
-                "brew install tracer-cloud/tap/opensre",
-                "curl -fsSL https://install.opensre.com | bash",
-                "OPENSRE_AUTO_LAUNCH=0",
-                "OPENSRE_SKIP_GH_INSTALL=1",
-                "Homebrew installs pull in `gh` automatically.",
+                "curl -fsSL https://install.opensre.com | bash -s -- -dc",
+                "## Before you begin",
+                "## Step 1: Install and start opensre",
+                "opensre\n",
+                "images/opensre-welcome.png",
             ),
         ),
         (
@@ -287,6 +379,26 @@ def test_install_docs_list_every_process(path: Path, needles: tuple[str, ...]) -
     text = path.read_text(encoding="utf-8")
     for needle in needles:
         assert needle in text, f"{path.name} missing install step {needle!r}"
+    for retired_instruction in (
+        "brew ",
+        "homebrew",
+        "irm https://install.opensre.com | iex",
+        "pipx install opensre",
+        "opensre_auto_launch",
+        "opensre_skip_gh_install",
+    ):
+        assert retired_instruction not in text.lower(), (
+            f"{path.name} advertises retired install guidance {retired_instruction!r}"
+        )
+
+
+def test_windows_install_docs_use_powershell_installer() -> None:
+    command = "& ([scriptblock]::Create((irm https://install.opensre.com/install.ps1)))"
+    windows = (REPO_ROOT / "docs" / "install" / "windows-local.mdx").read_text(encoding="utf-8")
+    readme = README.read_text(encoding="utf-8")
+    assert f"{command} -dc" in windows
+    assert f"{command} -gh" in readme
+    assert "WSL" not in windows
 
 
 def test_install_sh_help_lists_all_channels() -> None:
@@ -364,7 +476,9 @@ def test_homebrew_sync_script_updates_formula_checksums() -> None:
 def test_dockerfile_installs_runtime_entrypoint() -> None:
     text = DOCKERFILE.read_text(encoding="utf-8")
     assert "FROM python:" in text
-    assert "opensre gateway" in text or "uvicorn gateway.web.webapp" in text
+    assert "opensre-container-entrypoint.py" in text
+    assert "COPY . /app" not in text
+    assert "pip install" not in text
 
 
 def test_makefile_install_uses_uv_sync() -> None:
@@ -374,6 +488,104 @@ def test_makefile_install_uses_uv_sync() -> None:
 
 
 # ── Sandboxed install.sh end-to-end (all channels) ───────────────────────────
+
+
+@pytest.mark.parametrize("prior_marker", [False, True])
+@pytest.mark.parametrize("state_location", ["default", "home", "wizard", "wizard-relative"])
+def test_install_sh_records_marker_before_binary_runs(
+    tmp_path: Path, prior_marker: bool, state_location: str
+) -> None:
+    state_dir = (
+        tmp_path / "home" / ".opensre" if state_location == "default" else tmp_path / "custom state"
+    )
+    state_dir.mkdir(parents=True)
+    marker = state_dir / "installed"
+    if prior_marker:
+        marker.touch()
+    recorded = tmp_path / "marker-observation"
+    environment = {
+        "OPENSRE_TEST_MARKER_MUTATION": "remove" if prior_marker else "create",
+        "OPENSRE_TEST_MARKER_LOG": str(recorded),
+    }
+    if state_location == "home":
+        environment["OPENSRE_HOME"] = str(state_dir)
+    elif state_location.startswith("wizard"):
+        environment["OPENSRE_HOME"] = str(tmp_path / "unused home")
+        wizard_store = state_dir / "wizard.json"
+        environment["OPENSRE_WIZARD_STORE_PATH"] = str(
+            wizard_store.relative_to(tmp_path)
+            if state_location == "wizard-relative"
+            else wizard_store
+        )
+
+    result = _run_install_sh(tmp_path, "--main", env_extra=environment)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert marker.exists() is not prior_marker
+    assert recorded.read_text().strip() == ("present" if prior_marker else "absent")
+
+
+def test_make_install_snapshots_before_dependency_install(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    shim_bin = tmp_path / "bin"
+    shim_bin.mkdir()
+    recorded = tmp_path / "marker-observation"
+    uv = shim_bin / "uv"
+    uv.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = sync ]; then\n'
+        '  mkdir -p "$OPENSRE_HOME"\n'
+        '  touch "$OPENSRE_HOME/installed"\n'
+        "else\n"
+        '  printf "%s" "$OPENSRE_INSTALL_MARKER_STATE" > "$OPENSRE_TEST_MARKER_LOG"\n'
+        "fi\n"
+    )
+    uv.chmod(0o755)
+    environment = os.environ | {
+        "PATH": f"{shim_bin}{os.pathsep}{os.environ['PATH']}",
+        "OPENSRE_HOME": str(state_dir),
+        "OPENSRE_TEST_MARKER_LOG": str(recorded),
+    }
+
+    result = subprocess.run(
+        ["make", "install", f"PYTHON={sys.executable}", "MAKE=true", f"PATH={environment['PATH']}"],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (state_dir / "installed").exists()
+    assert recorded.read_text() == "absent"
+
+
+def test_install_sh_retries_github_rate_limit_then_installs(tmp_path: Path) -> None:
+    """A 403 from the release API is retried; a missing tag is not."""
+    limited_root = tmp_path / "limited"
+    limited_root.mkdir()
+    limited = _run_install_sh(limited_root, "--main", curl_mode="rate-limit")
+    limited_out = limited.stdout + limited.stderr
+    assert limited.returncode == 0, limited_out
+    assert "HTTP 403" in limited.stderr
+    assert "retrying" in limited.stderr
+    calls = (tmp_path / "limited" / "shim-bin" / "calls.log").read_text(encoding="utf-8")
+    assert [line for line in calls.splitlines() if line.startswith("api ")] == [
+        "api 403",
+        "api 200",
+    ]
+
+    missing_root = tmp_path / "missing"
+    missing_root.mkdir()
+    missing = _run_install_sh(missing_root, "--version", "2026.4.29", curl_mode="missing")
+    missing_out = missing.stdout + missing.stderr
+    assert missing.returncode != 0
+    assert "404" in missing_out
+    assert "retrying" not in missing_out
+    missing_calls = (tmp_path / "missing" / "shim-bin" / "calls.log").read_text(encoding="utf-8")
+    assert missing_calls.splitlines() == ["api 404"]
 
 
 def test_install_sh_main_channel_end_to_end(tmp_path: Path) -> None:
@@ -471,3 +683,33 @@ def test_homebrew_formula_resolvable_when_brew_present() -> None:
     assert formulae, "brew info returned no formulae"
     name = formulae[0].get("name") or formulae[0].get("full_name")
     assert name and "opensre" in str(name)
+
+
+@pytest.mark.parametrize(
+    ("tag", "origin"),
+    [("-lp", "landing_page"), ("-gh", "github"), ("-dc", "documentation"), (None, "")],
+)
+@pytest.mark.parametrize("track", ["main", "release"])
+def test_piped_installer_keeps_origin_separate_from_build_track(
+    tmp_path: Path, tag: str | None, origin: str, track: str
+) -> None:
+    recorded = tmp_path / "origin-observation"
+    args = [f"--{track}", *([tag] if tag else [])]
+    result = _run_install_sh(
+        tmp_path,
+        *args,
+        piped=True,
+        env_extra={
+            "OPENSRE_TEST_ORIGIN_LOG": str(recorded),
+            "OPENSRE_INSTALL_ORIGIN": "inherited-value-must-not-attribute-an-untagged-command",
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert recorded.read_text().splitlines() == [origin, track, "posix_installer"]
+
+
+def test_installer_rejects_conflicting_origin_tags_before_installing(tmp_path: Path) -> None:
+    result = _run_install_sh(tmp_path, "-lp", "-gh", piped=True)
+    assert result.returncode != 0
+    assert "only one installation origin" in result.stderr
+    assert not (tmp_path / "opt" / "bin" / "opensre").exists()

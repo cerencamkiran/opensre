@@ -7,14 +7,15 @@ Internal notes for repository automation under `.github/workflows/`. Not publish
 | Workflow | Purpose |
 | -------- | ------- |
 | [`ci.yml`](ci.yml) | PR/push quality gates and sharded pytest |
-| [`ci-labels-windows.yml`](ci-labels-windows.yml) | Optional Windows CI (`ci:windows` label) |
+| [`ci-labels-windows.yml`](ci-labels-windows.yml) | Focused Windows CI for native shell/process changes; `ci:windows` also opts into the advisory full suite |
 | [`codeql.yml`](codeql.yml) | Full post-merge CodeQL and manual PR-profile benchmarks |
 | [`greptile-pr-reminder.yml`](greptile-pr-reminder.yml) | Greptile review nudge on PR open |
 | [`celebrate-merged-pr.yml`](celebrate-merged-pr.yml) | Post-merge celebration comment |
 | [`good-first-issue-assign.yml`](good-first-issue-assign.yml) | Auto-assign good first issues |
 | [`release-safety-scheduled.yml`](release-safety-scheduled.yml) | Hourly release safety regression check |
 | [`release.yml`](release.yml) | Release builds and artifacts |
-| [`installer-canary.yml`](installer-canary.yml) | Post-publish canaries for the public install paths (CDN, GitHub release resolution, PowerShell, Homebrew) on Linux/macOS/Windows |
+| [`installer-canary.yml`](installer-canary.yml) | Post-publish canaries for the public install paths (CDN, GitHub release resolution, platform installers) on Linux/macOS/Windows |
+| [`telemetry-integrity.yml`](telemetry-integrity.yml) | Post-merge telemetry identity/login probes in fresh processes on Linux/macOS/Windows and a Linux container (see [`tests/analytics/INTEGRITY.md`](../../tests/analytics/INTEGRITY.md)) |
 
 See [CI.md](../../CI.md) for local parity commands before push.
 

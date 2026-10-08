@@ -10,6 +10,7 @@ import pytest
 from core.agent_harness.session.pending_choice import PendingUserChoice
 from core.agent_harness.turns.turn_results import ToolCallingTurnResult, TurnResult
 from core.domain.types.tools import ToolSurface
+from core.llm.readiness import LLMReadiness
 from core.llm.types import ToolCall
 from core.tool.contracts import RegisteredTool, SideEffectLevel
 from core.tool.execution import BeforeToolCallResult, ToolExecutionHooks, ToolExecutionRequest
@@ -18,9 +19,17 @@ from infrastructure.turn_host.session_lock import session_execution_lock
 from surfaces.cli.ask import service
 from surfaces.cli.ask import session as ask_session
 from surfaces.cli.ask.approval import unknown_allowed_tools
+from surfaces.cli.ask.file_input import AskFileInput
 from surfaces.cli.ask.service import AskExitCode, AskSignal, AskStatus
 
 _CHAT_ONLY_TOOL = "query_tempo"
+_LLM_CONFIGURED = LLMReadiness(provider="openai")
+
+
+@pytest.fixture(autouse=True)
+def _llm_route_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests fake the turn; the LLM preflight is pinned in test_ask_llm_setup.py."""
+    monkeypatch.setattr(service, "llm_ready", lambda: _LLM_CONFIGURED)
 
 
 def _turn(
@@ -359,6 +368,7 @@ def test_run_ask_leases_a_fresh_persisted_session_before_its_first_turn(monkeypa
 
     monkeypatch.setattr(service, "_ask_session_lock", _lock)
     monkeypatch.setattr(service, "_run_agent_turn", run_turn)
+    monkeypatch.setattr(service, "claim_process_session_id", lambda: None)
     monkeypatch.setattr(service, "uuid4", lambda: "fresh-session-id")
 
     service.run_ask("prompt", allowed_tools=(), bypass_approvals=False)
@@ -856,6 +866,43 @@ def test_agent_turn_binds_hooks_and_restricts_capabilities_via_start(monkeypatch
     assert session.available_capabilities["shell"] == ("keep",)
     assert recorded["prompt"] == "hello"
     assert result.primary_response_text == "answer"
+    assert manager.closed == [(session, False)]
+
+
+def test_resumed_agent_turn_rejects_context_while_answering_choice(monkeypatch) -> None:
+    manager = _FakeSessionManager()
+    session = _FakeSession()
+    pending = PendingUserChoice(
+        title="Which environment?",
+        options=("Production", "Staging"),
+    )
+    session.pending_user_choice = pending
+
+    class _RecordingAgentSession:
+        @classmethod
+        def start(cls, _config: object, **_kwargs: object) -> _RecordingAgentSession:
+            return cls()
+
+        @property
+        def bound_session(self) -> _FakeSession:
+            return session
+
+        def chat(self, _prompt: str, **_kwargs: object) -> TurnResult:
+            pytest.fail("agent turn should not start")
+
+    monkeypatch.setattr(service, "SessionManager", lambda: manager)
+    monkeypatch.setattr(service, "AgentSession", _RecordingAgentSession)
+
+    with pytest.raises(service.OpenSREError, match="answering a pending choice"):
+        service._run_agent_turn(
+            "2",
+            ToolExecutionHooks(),
+            session_id=session.session_id,
+            ephemeral=False,
+            context_files=(AskFileInput(path="alert.txt", content="latency spike"),),
+        )
+
+    assert session.pending_user_choice == pending
     assert manager.closed == [(session, False)]
 
 
